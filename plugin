@@ -1,0 +1,594 @@
+<?php
+/**
+ * Plugin Name: Woocommerce Free Download Email Gate
+ * Description: Replaces the 'Add to Cart' button with an email gate for free ($0) downloadable WooCommerce products, providing the download link via email.
+ * Version: 1.1
+ * Author: Krishna Sutradhar
+ * Author URI: https://krishnasu.com/
+ * License: GPL2
+ */
+
+if (!defined('ABSPATH')) {
+    exit; // Exit if accessed directly.
+}
+
+// ======================================================================================
+// !!! ACTION REQUIRED: SET YOUR WEBHOOK URL HERE !!!
+// Replace 'YOUR_MAILCHIMP_OR_ZAPIER_WEBHOOK_URL_HERE' with the actual URL provided 
+// by Mailchimp, Zapier, Pabbly Connect, or any other marketing automation service.
+// This URL will receive a JSON payload with the collected user data.
+// ======================================================================================
+define('WFDG_WEBHOOK_URL', 'YOUR_MAILCHIMP_OR_ZAPIER_WEBHOOK_URL_HERE'); 
+
+// Check if WooCommerce is active
+if (!in_array('woocommerce/woocommerce.php', apply_filters('active_plugins', get_option('active_plugins')))) {
+    return;
+}
+
+class WooFreeDownloadEmailer {
+
+    private $plugin_slug = 'woo_free_download_emailer';
+    private $email_log_option = 'woo_free_download_emails';
+    private $download_url_param = 'woo_dl_token';
+
+    public function __construct() {
+        // High priority to replace the button before other plugins might interfere
+        add_action('woocommerce_simple_add_to_cart', array($this, 'replace_add_to_cart_button'), 1);
+
+        // Add the hidden modal HTML to the footer
+        add_action('wp_footer', array($this, 'render_download_modal'));
+
+        // Enqueue scripts and styles
+        add_action('wp_enqueue_scripts', array($this, 'enqueue_scripts_and_styles'));
+
+        // Handle the AJAX request for email submission
+        add_action('wp_ajax_nopriv_free_download_request', array($this, 'handle_free_download_request'));
+        add_action('wp_ajax_free_download_request', array($this, 'handle_free_download_request'));
+
+        // Handle the secured download request
+        add_action('template_redirect', array($this, 'handle_secure_download'));
+        
+        // Add admin notice if webhook URL is not configured
+        if (is_admin() && WFDG_WEBHOOK_URL === 'YOUR_MAILCHIMP_OR_ZAPIER_WEBHOOK_URL_HERE') {
+            add_action('admin_notices', array($this, 'webhook_config_notice'));
+        }
+    }
+
+    /**
+     * Admin notice to remind user to configure the webhook URL.
+     */
+    public function webhook_config_notice() {
+        ?>
+        <div class="notice notice-warning is-dismissible">
+            <p><strong>WooCommerce Free Download Email Gate:</strong> You must configure your webhook URL in the plugin file (`woo-free-download-email-gate.php`) to enable external integration (Mailchimp/Zapier/etc.).</p>
+        </div>
+        <?php
+    }
+
+    /**
+     * Check if the product is free and downloadable.
+     * @param WC_Product $product
+     * @return bool
+     */
+    private function is_free_downloadable($product) {
+        return $product->is_downloadable() && $product->get_price() == 0;
+    }
+
+    /**
+     * Replaces the 'Add to Cart' button with the custom download button if conditions are met.
+     */
+    public function replace_add_to_cart_button() {
+        global $product;
+
+        if (!$product || !is_product() || $product->is_type('variable')) {
+            return;
+        }
+
+        if ($this->is_free_downloadable($product)) {
+            // Remove the default 'Add to Cart' button action
+            remove_action('woocommerce_simple_add_to_cart', 'woocommerce_simple_add_to_cart', 30);
+
+            // Output the custom button
+            echo '<button 
+                    class="download-modal-trigger w-full px-8 py-3 bg-indigo-600 text-white font-bold rounded-lg shadow-lg hover:bg-indigo-700 transition duration-300 transform hover:scale-[1.02]"
+                    data-product-id="' . esc_attr($product->get_id()) . '">
+                    Get Download Link
+                </button>';
+        }
+    }
+
+    /**
+     * Enqueues the necessary scripts and styles.
+     */
+    public function enqueue_scripts_and_styles() {
+        if (!is_product()) {
+            return;
+        }
+
+        // --- CSS Handling ---
+        wp_register_style($this->plugin_slug . '-style', false, [], '1.0');
+        wp_enqueue_style($this->plugin_slug . '-style');
+
+        // Inline CSS for the modal (Tailwind emulation for simplicity)
+        $css = "
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.75);
+            display: none;
+            justify-content: center;
+            align-items: center;
+            z-index: 9999;
+            backdrop-filter: blur(5px);
+        }
+        .modal-content {
+            background-color: #ffffff;
+            padding: 2rem;
+            border-radius: 0.75rem;
+            width: 90%;
+            max-width: 400px;
+            box-shadow: 0 10px 15px rgba(0, 0, 0, 0.2);
+            position: relative;
+        }
+        .close-button {
+            position: absolute;
+            top: 10px;
+            right: 15px;
+            font-size: 1.5rem;
+            line-height: 1;
+            cursor: pointer;
+            color: #4b5563;
+        }
+        .loading-spinner {
+            border: 4px solid rgba(0, 0, 0, 0.1);
+            border-top: 4px solid #3b82f6;
+            border-radius: 50%;
+            width: 24px;
+            height: 24px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 10px;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        ";
+
+        wp_add_inline_style($this->plugin_slug . '-style', $css);
+
+        // --- JS Handling ---
+        wp_register_script($this->plugin_slug . '-script', false, [], '1.0', true); 
+        wp_enqueue_script($this->plugin_slug . '-script');
+
+        // Inline JavaScript for modal handling and AJAX
+        $js = "
+        document.addEventListener('DOMContentLoaded', function() {
+            const trigger = document.querySelector('.download-modal-trigger');
+            const modal = document.getElementById('free-download-modal');
+            const closeBtn = document.querySelector('.close-button');
+            const form = document.getElementById('free-download-form');
+            const messageBox = document.getElementById('download-message-box');
+            const loadingSpinner = document.getElementById('download-loading');
+            const instructionText = document.getElementById('download-instruction-text'); 
+
+            if (trigger && modal && form) {
+                let currentProductId = null;
+
+                // Open Modal
+                trigger.addEventListener('click', function(e) {
+                    e.preventDefault();
+                    currentProductId = this.getAttribute('data-product-id');
+                    messageBox.innerHTML = '';
+                    form.style.display = 'block';
+                    if (instructionText) {
+                        instructionText.style.display = 'block'; // Ensure instructional text is visible when opening
+                    }
+                    modal.style.display = 'flex'; // This should make the modal visible
+                });
+
+                // Close Modal
+                closeBtn.addEventListener('click', function() {
+                    modal.style.display = 'none';
+                });
+
+                modal.addEventListener('click', function(e) {
+                    if (e.target === modal) {
+                        modal.style.display = 'none';
+                    }
+                });
+                
+                // Form Submission (AJAX)
+                form.addEventListener('submit', function(e) {
+                    e.preventDefault();
+
+                    const emailInput = document.getElementById('download-email');
+                    const email = emailInput.value;
+
+                    if (!email || !/\S+@\S+\.\S+/.test(email)) {
+                        messageBox.innerHTML = '<p class=\"text-red-500\">Please enter a valid email address.</p>';
+                        return;
+                    }
+
+                    // Show loading
+                    form.style.display = 'none';
+                    loadingSpinner.style.display = 'block';
+                    messageBox.innerHTML = '';
+
+
+                    const formData = new FormData();
+                    formData.append('action', 'free_download_request');
+                    formData.append('email', email);
+                    formData.append('product_id', currentProductId);
+                    formData.append('security', '" . wp_create_nonce('free_download_nonce') . "');
+
+                    fetch('" . admin_url('admin-ajax.php') . "', {
+                        method: 'POST',
+                        body: formData
+                    })
+                    .then(response => response.json())
+                    .then(data => {
+                        loadingSpinner.style.display = 'none';
+                        if (data.success) {
+                            messageBox.innerHTML = '<p class=\"text-green-600 font-semibold\">Success! Your download link has been sent to your email. Please check your spam folder.</p>';
+                            form.reset();
+                            if (instructionText) {
+                                instructionText.style.display = 'none'; // Hide the instructional text on success
+                            }
+                        } else {
+                            // Display the specific error message provided by the PHP backend
+                            messageBox.innerHTML = '<p class=\"text-red-500\">' + (data.data || 'Sorry, there was an issue sending the download link.') + '</p>';
+                            form.style.display = 'block'; // Show form again on error
+                        }
+                    })
+                    .catch(error => {
+                        loadingSpinner.style.display = 'none';
+                        messageBox.innerHTML = '<p class=\"text-red-500\">A network error occurred. Please try again.</p>';
+                        form.style.display = 'block'; // Show form again on network error
+                        console.error('Error:', error);
+                    });
+                });
+            }
+        });
+        ";
+        wp_add_inline_script($this->plugin_slug . '-script', $js);
+    }
+
+    /**
+     * Renders the hidden modal HTML for email capture.
+     */
+    public function render_download_modal() {
+        if (!is_product()) {
+            return;
+        }
+        ?>
+        <div id="free-download-modal" class="modal-overlay">
+            <div class="modal-content">
+                <span class="close-button">&times;</span>
+                <h3 class="text-xl font-bold mb-4 text-gray-800">Free Download</h3>
+                <!-- Added ID here -->
+                <p id="download-instruction-text" class="mb-4 text-gray-600">Please enter your email address to receive the download link.</p>
+                
+                <div id="download-message-box" class="mb-4 text-center"></div>
+
+                <div id="download-loading" class="loading-spinner mb-4" style="display: none;"></div>
+
+                <form id="free-download-form" class="space-y-4">
+                    <input type="email" id="download-email" name="email" required placeholder="Your Email Address" 
+                           class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                    
+                    <button type="submit" class="w-full px-4 py-2 bg-indigo-600 text-white font-semibold rounded-lg hover:bg-indigo-700 transition duration-300">
+                        Send Link via Email
+                    </button>
+                </form>
+            </div>
+        </div>
+        <?php
+    }
+
+    /**
+     * Pushes collected data to the defined external webhook URL.
+     * @param array $data The data to send.
+     */
+    private function send_to_webhook(array $data) {
+        if (WFDG_WEBHOOK_URL === 'YOUR_MAILCHIMP_OR_ZAPIER_WEBHOOK_URL_HERE') {
+            // Webhook is not configured, silently exit.
+            return;
+        }
+
+        $response = wp_remote_post(WFDG_WEBHOOK_URL, [
+            'method'      => 'POST',
+            'timeout'     => 5, // 5 seconds timeout
+            'redirection' => 5,
+            'httpversion' => '1.0',
+            'blocking'    => false, // Non-blocking request to avoid slowing down the user experience
+            'headers'     => [
+                'Content-Type' => 'application/json',
+            ],
+            'body'        => json_encode($data),
+            'data_format' => 'body',
+        ]);
+        
+        // You can optionally log webhook failures here for debugging:
+        // if (is_wp_error($response)) {
+        //     error_log('Webhook failed: ' . $response->get_error_message());
+        // }
+    }
+
+
+    /**
+     * Handles the AJAX request, generates a secure link, logs email, and sends the email.
+     */
+    public function handle_free_download_request() {
+        if (!isset($_POST['security']) || !wp_verify_nonce($_POST['security'], 'free_download_nonce')) {
+            wp_send_json_error('Security check failed. Please refresh the page and try again.');
+        }
+        
+        if (is_user_logged_in() && !defined('DOING_AJAX')) {
+            wp_send_json_error('Invalid context.');
+        }
+
+        $email = sanitize_email($_POST['email']);
+        $product_id = intval($_POST['product_id']);
+
+        if (!is_email($email) || $product_id <= 0) {
+            wp_send_json_error('Invalid email or product ID.');
+        }
+
+        $product = wc_get_product($product_id);
+
+        if (!$product || !$this->is_free_downloadable($product)) {
+            wp_send_json_error('Product not found or not available for download.');
+        }
+
+        // 1. Generate a secure, unique, time-limited token
+        $token = bin2hex(random_bytes(16)); // 32-char hex string
+        $expiration = time() + (2 * HOUR_IN_SECONDS); // Link expires in 2 hours
+
+        // Store the token and product ID as a transient
+        $transient_key = $this->plugin_slug . '_token_' . $token;
+        set_transient($transient_key, [
+            'product_id' => $product_id,
+            'expiration' => $expiration,
+            'email' => $email
+        ], 2 * HOUR_IN_SECONDS);
+
+        // 2. Generate the unique download URL
+        $download_url = add_query_arg($this->download_url_param, $token, home_url('/'));
+        
+        $product_name = $product->get_name();
+        $date_submitted = current_time('mysql');
+        $ip_address = $_SERVER['REMOTE_ADDR'];
+
+        // 3. Log the email for later export/CRM
+        $this->log_email($email, $product_id, $product_name, $date_submitted, $ip_address);
+        
+        // 4. Send data to external Webhook
+        $webhook_data = [
+            'email'          => $email,
+            'product_name'   => $product_name,
+            'product_id'     => $product_id,
+            'date_submitted' => $date_submitted,
+            'ip_address'     => $ip_address,
+            'download_link'  => $download_url
+        ];
+        $this->send_to_webhook($webhook_data);
+
+        // 5. Send the email
+        $subject = 'Your Free Download Link: ' . $product_name;
+        $message = "Dear Customer,\n\nHere is the download link for the free digital product you requested. This link will be valid for 2 hours:\n\n"
+                 . "<a href=\"{$download_url}\">Click here to start your download</a>\n\n"
+                 . "Or copy this direct link:\n{$download_url}\n\n"
+                 . "Thank you,\n"
+                 . get_bloginfo('name') . " Team";
+
+        // Use HTML email format for better presentation
+        add_filter('wp_mail_content_type', function() { return 'text/html'; });
+
+        $mail_sent = wp_mail($email, $subject, nl2br($message));
+
+        // Reset email format
+        remove_filter('wp_mail_content_type', function() { return 'text/html'; });
+
+        if ($mail_sent) {
+            wp_send_json_success('Download link successfully sent.');
+        } else {
+            // Log for debugging: error_log("Failed to send download email to: " . $email);
+            wp_send_json_error('The website could not send the email. Please contact support.');
+        }
+    }
+
+    /**
+     * Handles the secure download link and serves the file.
+     */
+    public function handle_secure_download() {
+        if (!isset($_GET[$this->download_url_param])) {
+            return;
+        }
+
+        $token = sanitize_text_field($_GET[$this->download_url_param]);
+        $transient_key = $this->plugin_slug . '_token_' . $token;
+        $data = get_transient($transient_key);
+
+        if (!$data || empty($data['product_id']) || $data['expiration'] < time()) {
+            wp_die('The download link is invalid or has expired.', 'Invalid Link', ['response' => 403]);
+        }
+
+        $product_id = $data['product_id'];
+        $product = wc_get_product($product_id);
+        
+        if (!$product || !$product->is_downloadable()) {
+             wp_die('Product not found or not available for download.', 'Error', ['response' => 404]);
+        }
+        
+        // Use WooCommerce's built-in download handling for security and logging
+        $download_files = $product->get_files();
+
+        if (empty($download_files)) {
+            wp_die('Sorry, no files are attached to this product.', 'No File', ['response' => 404]);
+        }
+        
+        // Assuming the product has at least one downloadable file
+        $file_key = array_key_first($download_files);
+        $file = $download_files[$file_key];
+        
+        // Delete the transient immediately after successful file retrieval to prevent reuse
+        delete_transient($transient_key);
+
+        // This function handles file security and redirection (or serving the file)
+        wc_download_file($file['file'], $product, $file_key);
+
+        exit;
+    }
+
+    /**
+     * Logs the collected email to the WordPress options table.
+     * @param string $email
+     * @param int $product_id
+     */
+    private function log_email($email, $product_id, $product_name, $date_submitted, $ip_address) {
+        $log_data = get_option($this->email_log_option, []);
+
+        $new_entry = [
+            'email' => $email,
+            'product_name' => $product_name,
+            'date' => $date_submitted,
+            'ip' => $ip_address 
+        ];
+
+        // We use an indexed array, which we will key by index for deletion later.
+        $log_data[] = $new_entry; 
+        update_option($this->email_log_option, $log_data);
+    }
+}
+
+// Initialize the plugin
+function initialize_woo_free_download_emailer() {
+    new WooFreeDownloadEmailer();
+}
+add_action('plugins_loaded', 'initialize_woo_free_download_emailer');
+
+// Optional: Admin menu for CSV export and log clearing
+add_action('admin_menu', function() {
+    add_menu_page(
+        'Collected Free Download Emails', // Admin Menu Title
+        'Free Download Emails', // Menu Item Title
+        'manage_options',
+        'free-download-emails',
+        'woo_free_download_email_export_page',
+        'dashicons-download',
+        30
+    );
+});
+
+function woo_free_download_email_export_page() {
+    $log_option_key = 'woo_free_download_emails';
+    $log_data = get_option($log_option_key, []);
+    $message = '';
+
+    // --- 1. Handle Selected Deletion ---
+    if (isset($_POST['delete_selected']) && current_user_can('manage_options') && wp_verify_nonce($_POST['_wpnonce_delete_selected'], 'delete_selected_free_download_log')) {
+        $selected_indices = isset($_POST['selected_emails']) ? array_map('intval', $_POST['selected_emails']) : [];
+        
+        if (!empty($selected_indices)) {
+            $new_log_data = [];
+            $initial_count = count($log_data);
+
+            // Iterate through the existing data. If the index is NOT in the selected list, keep it.
+            foreach ($log_data as $key => $entry) {
+                if (!in_array($key, $selected_indices)) {
+                    $new_log_data[] = $entry; // Re-index to keep the array clean
+                }
+            }
+
+            if (update_option($log_option_key, $new_log_data)) {
+                $deleted_count = $initial_count - count($new_log_data);
+                $log_data = $new_log_data; // Update local variable for rendering
+                $message = '<div class="notice notice-success is-dismissible"><p><strong>Success!</strong> ' . $deleted_count . ' email entries have been deleted.</p></div>';
+            } else {
+                $message = '<div class="notice notice-error is-dismissible"><p>Error: Could not update the email log.</p></div>';
+            }
+        } else {
+            $message = '<div class="notice notice-error is-dismissible"><p>Please select at least one email to delete.</p></div>';
+        }
+    }
+    
+    // --- 2. Handle Clear All Log Deletion ---
+    if (isset($_POST['clear_log']) && current_user_can('manage_options') && wp_verify_nonce($_POST['_wpnonce_clear_log'], 'clear_free_download_log')) {
+        if (delete_option($log_option_key)) {
+            // Re-initialize the log to an empty array so the page renders correctly right away
+            $log_data = [];
+            $message = '<div class="notice notice-success is-dismissible"><p><strong>Success!</strong> All email entries have been permanently deleted.</p></div>';
+        } else {
+            $message = '<div class="notice notice-error is-dismissible"><p>Error: The email log could not be cleared.</p></div>';
+        }
+    }
+
+    // Display admin page content
+    ?>
+    <div class="wrap">
+        <h1 class="wp-heading-inline">Collected Free Download Emails</h1>
+        
+        <?php echo $message; // Display success/error messages ?>
+
+        <div class="flex items-center space-x-4 mb-4">
+            
+            <form method="post" style="display:inline-block;">
+                <input type="submit" name="export_csv" value="Export to CSV" class="button button-primary">
+            </form>
+            
+            <?php if (!empty($log_data)): ?>
+            <!-- Form for Deleting Selected Emails -->
+            <form id="delete-selected-form" method="post" style="display:inline-block;" onsubmit="return confirm('Are you sure you want to delete the selected email entries?');">
+                <?php wp_nonce_field('delete_selected_free_download_log', '_wpnonce_delete_selected'); ?>
+                <input type="submit" name="delete_selected" value="Delete Selected" class="button button-secondary delete">
+            </form>
+
+            <!-- Form for Deleting ALL Emails -->
+            <form method="post" style="display:inline-block;" onsubmit="return confirm('WARNING: Are you sure you want to delete ALL collected email entries? This action is irreversible.');">
+                <?php wp_nonce_field('clear_free_download_log', '_wpnonce_clear_log'); ?>
+                <input type="submit" name="clear_log" value="Clear All Emails" class="button button-secondary delete">
+            </form>
+            <?php endif; ?>
+
+        </div>
+        
+        <?php if (!empty($log_data)): ?>
+        <p>Total Collected Emails: <strong><?php echo count($log_data); ?></strong></p>
+        
+        <!-- The form action is now tied to the Delete Selected form -->
+        <table class="wp-list-table widefat fixed striped">
+            <thead>
+                <tr>
+                    <th class="check-column">
+                        <input type="checkbox" id="check-all" onclick="document.querySelectorAll('.email-checkbox').forEach(cb => cb.checked = this.checked);">
+                    </th>
+                    <th>Email</th>
+                    <th>Product Name</th>
+                    <th>Date</th>
+                    <th>IP Address</th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php foreach ($log_data as $key => $entry): ?>
+                <tr>
+                    <th scope="row" class="check-column">
+                        <!-- We use the array key ($key) as the identifier for deletion -->
+                        <input type="checkbox" name="selected_emails[]" value="<?php echo esc_attr($key); ?>" class="email-checkbox" form="delete-selected-form">
+                    </th>
+                    <td><?php echo esc_html($entry['email']); ?></td>
+                    <td><?php echo esc_html($entry['product_name']); ?></td>
+                    <td><?php echo esc_html($entry['date']); ?></td>
+                    <td><?php echo esc_html($entry['ip']); ?></td>
+                </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+        <?php else: ?>
+        <p>No emails have been collected yet.</p>
+        <?php endif; ?>
+    </div>
+    <?php
+}
