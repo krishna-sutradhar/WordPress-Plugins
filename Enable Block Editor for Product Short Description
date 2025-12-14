@@ -1,0 +1,59 @@
+/**
+ * Plugin Name: Enable Block Editor for Product Short Description (Robust)
+ * Description: Forces the WooCommerce Product Short Description field to use the WordPress Block Editor (Gutenberg) 
+ * by using both the official WooCommerce filter and a robust WordPress core workaround.
+ * Author: Krishna Sutradhar
+ * Version: 1.3 - Added explicit post type support for 'excerpt' within the block editor context to resolve short description conflicts.
+ */
+
+// Exit if accessed directly.
+if ( ! defined( 'ABSPATH' ) ) {
+	exit;
+}
+
+/**
+ * Robustly enables the Block Editor for both the main Product Description 
+ * and the Product Short Description (Excerpt).
+ * * This function uses three methods for maximum compatibility:
+ * 1. The specific WooCommerce filter for the excerpt box.
+ * 2. An aggressive core filter (use_block_editor_for_post) to ensure the 'product' 
+ * post type overrides any global disablers (like the Classic Editor plugin).
+ * 3. Explicitly adding 'excerpt' support back to the 'product' post type, 
+ * which forces the Block Editor to recognize and use it for the short description.
+ */
+function my_force_block_editor_on_product_post_type() {
+    
+    // Check if we are in the admin area, where these changes are relevant.
+    if ( ! is_admin() ) {
+        return;
+    }
+    
+    // Ensure 'product' post type exists before hooking.
+    if ( ! post_type_exists( 'product' ) ) {
+        return;
+    }
+
+    // --- Method 1: The correct WooCommerce filter for the Short Description (Excerpt) ---
+    // This is the official way, but often fails due to conflicts.
+    add_filter( 'woocommerce_product_short_description_editor_enabled', '__return_true' );
+
+    // --- Method 2: Aggressively force Block Editor for the 'product' post type (Conflict Solver) ---
+    // This ensures the main product editor works and is usually necessary for Method 3 to function.
+    add_filter( 'use_block_editor_for_post', function( $enabled, $post ) {
+        // Only apply if $post exists and is a 'product'
+        if ( $post && 'product' === $post->post_type ) {
+            return true; // Force Block Editor
+        }
+        return $enabled; // Keep existing behavior for other post types
+    }, 99, 2 ); // High priority (99) to run late and override other filters.
+    
+    // --- Method 3: Explicitly enable 'excerpt' support for the post type (Short Description Fix) ---
+    // This is the key fix when the WooCommerce filter fails, as it forces the 
+    // WordPress core to treat the excerpt area as block-enabled.
+    add_action( 'init', function() {
+        add_post_type_support( 'product', 'excerpt' );
+    }, 100 ); // Hooked slightly later (100) to ensure it overrides any previous removals.
+
+}
+// Hook into 'init' (early action) to ensure post type definitions can be modified before page load.
+add_action( 'init', 'my_force_block_editor_on_product_post_type', 99 );
